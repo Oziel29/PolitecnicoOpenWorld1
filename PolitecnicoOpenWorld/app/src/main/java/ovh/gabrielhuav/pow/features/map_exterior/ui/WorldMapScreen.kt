@@ -5,6 +5,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import android.annotation.SuppressLint
 import android.content.Context
 import android.webkit.WebView
+import com.google.gson.Gson
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -54,6 +55,7 @@ fun WorldMapScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val base64Cache = remember { mutableMapOf<String, String>() }
+    val gson = remember { Gson() }
 
     var currentFps by remember { mutableIntStateOf(0) }
     if (uiState.showFpsWidget) {
@@ -79,7 +81,6 @@ fun WorldMapScreen(
         // Ya no conectamos automáticamente aquí, el MainActivity se encarga de eso.
         onDispose {
             viewModel.stopGameLoop()
-            viewModel.disconnectFromMultiplayer() // Desconecta al salir al menú
         }
     }
 
@@ -91,7 +92,6 @@ fun WorldMapScreen(
             onTileServed       = { fromCache -> viewModel.notifyTileSource(fromCache) }
         )
     }
-
     Box(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
 
         if (uiState.isLoadingLocation) {
@@ -99,8 +99,7 @@ fun WorldMapScreen(
             Text("Iniciando mundo...", modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 32.dp))
             return@Box
         }
-
-        // ───── CAPA 1: MAPA ────────────────────────────────────────────────────────
+// ───── CAPA 1: MAPA ────────────────────────────────────────────────────────
         if (uiState.mapProvider == MapProvider.OSM) {
             AndroidView(
                 factory = { ctx ->
@@ -115,7 +114,7 @@ fun WorldMapScreen(
                 modifier = Modifier.fillMaxSize(),
                 update = { view ->
                     uiState.currentLocation?.let { view.controller.setCenter(it) }
-                    val zoomDiff = abs(view.zoomLevelDouble - uiState.zoomLevel)
+                    val zoomDiff = kotlin.math.abs(view.zoomLevelDouble - uiState.zoomLevel)
                     when {
                         zoomDiff < 0.01 -> {}
                         zoomDiff > 1.5  -> view.controller.animateTo(uiState.currentLocation, uiState.zoomLevel, 120L)
@@ -130,26 +129,66 @@ fun WorldMapScreen(
                         // CULLING NATIVO: Dependemos enteramente del zoom real de la vista
                         val currentZoom = view.zoomLevelDouble
                         val isZoomedIn = currentZoom >= 17.0
+                        val timeMs = System.currentTimeMillis()
 
-                        val activeIds = mutableSetOf<String>()
+                        // 1. LIMPIEZA DE DESCONECTADOS/ELIMINADOS
+                        // Extraemos los IDs que existen actualmente en el estado
+                        val currentNpcIds = uiState.npcs.map { it.id }.toSet()
+                        val iterator = markerCache.iterator()
+                        while (iterator.hasNext()) {
+                            val entry = iterator.next()
+                            // Si el marcador en caché ya no existe en la lista de NPCs, lo borramos
+                            if (!currentNpcIds.contains(entry.key)) {
+                                view.overlays.remove(entry.value) // Se quita del mapa visual
+                                iterator.remove()                 // Se quita de la memoria
+                            }
+                        }
+
+                        // 2. ACTUALIZACIÓN Y DIBUJADO DE MARCADORES ACTIVOS
                         uiState.npcs.forEach { npc ->
-                            val id = npc.id; activeIds.add(id)
+                            val id = npc.id
                             val marker = markerCache[id] ?: Marker(view).apply {
                                 title = "NPC_MARKER"
                                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                                markerCache[id] = this; view.overlays.add(this)
+                                isFlat = true
+                                markerCache[id] = this
+                                view.overlays.add(this)
                             }
 
-                            // 1. CULLING: Se dibuja solo si estamos cerca
+                            // Renderizado visual según el zoom
                             if (isZoomedIn) {
-                                marker.setAlpha(1f)
-                                if (npc.type == ovh.gabrielhuav.pow.domain.models.NpcType.CAR) {
-                                    val dynamicScale = (1.6 * Math.pow(2.0, currentZoom - 19.0)).toFloat().coerceIn(0.1f, 1.8f)
+                                if (npc.visualConfig != null) {
+                                    marker.setAlpha(1f)
+                                    val currentlyMoving = npc.speed > 0 || npc.isMoving
+                                    val isFacingRight = npc.facingRight
+
+                                    // ESCALA NATIVA: 0.28 hace match exacto con el tamaño del jugador
+                                    val spriteScale = (0.18 * Math.pow(2.0, currentZoom - 18.5)).toFloat().coerceIn(0.15f, 0.35f)
+
+                                    val drawable = ovh.gabrielhuav.pow.features.map_exterior.ui.components.CharacterSpriteManager.getModularNpcDrawable(
+                                        context = context,
+                                        visualConfig = npc.visualConfig!!,
+                                        isMoving = currentlyMoving,
+                                        isFacingRight = isFacingRight,
+                                        timeMs = timeMs,
+                                        scale = spriteScale,
+                                        displayName = npc.displayName // Inyectamos nombre
+                                    )
+
+                                    marker.icon = drawable
+                                    marker.rotation = 0f
+
+                                } else if (npc.type == ovh.gabrielhuav.pow.domain.models.NpcType.CAR) {
+                                    marker.setAlpha(1f)
+                                    // Los coches son base 1.4, los hace visualmente consistentes e imponentes
+                                    val dynamicScale = (1.4 * Math.pow(2.0, currentZoom - 19.0)).toFloat().coerceIn(0.2f, 2.5f)
                                     marker.icon = ovh.gabrielhuav.pow.features.map_exterior.ui.components.VehicleSpriteManager.getTintedCarNpc(
                                         context, npc.rotationAngle, npc.carColor, dynamicScale, npc.carModel
                                     )
                                     marker.rotation = 0f
                                 } else {
+                                    // SVG Clásicos (viejos marcadores)
+                                    marker.setAlpha(1f)
                                     val resId = context.resources.getIdentifier(npc.type.drawableName, "drawable", context.packageName)
                                     if (resId != 0) marker.icon = ContextCompat.getDrawable(context, resId)
                                     marker.rotation = npc.rotationAngle
@@ -158,8 +197,8 @@ fun WorldMapScreen(
                                 marker.setAlpha(0f)
                             }
 
-                            // 2. ACTUALIZACIÓN PERSISTENTE: Siempre movemos el marcador, sea o no visible
-                            marker.position = npc.location
+                            // 3. ACTUALIZACIÓN PERSISTENTE DE POSICIÓN
+                            marker.position = org.osmdroid.util.GeoPoint(npc.location.latitude, npc.location.longitude)
                         }
                     }
                     view.invalidate()
@@ -209,13 +248,11 @@ fun WorldMapScreen(
                     // Solo genera 1 imagen en ultra alta resolución (HiDPI pura) y se la avienta a JS.
                     val highResRenderScale = 1.0f * screenDensity
 
-                    val npcsJson = uiState.npcs.joinToString(prefix = "[", postfix = "]") { npc ->
+                    val npcPayloads = uiState.npcs.map { npc ->
                         if (npc.type == ovh.gabrielhuav.pow.domain.models.NpcType.CAR) {
                             var angle = npc.rotationAngle % 360f
                             if (angle < 0) angle += 360f
                             val frameIndex = (angle / 7.5f).roundToInt() % 48
-
-                            // La caché ahora solo depende del coche y su rotación, ignorando el zoom de Compose
                             val cacheKey = "${npc.carModel.name}_${frameIndex}_${npc.carColor}_${screenDensity}"
 
                             val base64Image = base64Cache.getOrPut(cacheKey) {
@@ -230,19 +267,65 @@ fun WorldMapScreen(
                                 } else { "" }
                             }
 
-                            // NO MANDAMOS 'sz'. JS lo calculará en tiempo real basado en su propio pellizco (pinch zoom)
-                            "{id:'${npc.id}',lat:${npc.location.latitude},lng:${npc.location.longitude}," +
-                                    "rot:${npc.rotationAngle},type:'CAR',base64:'$base64Image'}"
+                            NpcWebPayload(
+                                id = npc.id,
+                                lat = npc.location.latitude,
+                                lng = npc.location.longitude,
+                                rot = npc.rotationAngle,
+                                type = "CAR",
+                                base64 = base64Image,
+                                name = npc.displayName
+                            )
+
+                        } else if (npc.visualConfig != null) {
+                            val timeMs = System.currentTimeMillis()
+                            val currentlyMoving = npc.speed > 0 || npc.isMoving
+                            val visualConfig = npc.visualConfig!!
+                            val frameIndex = ovh.gabrielhuav.pow.features.map_exterior.ui.components.CharacterSpriteManager
+                                .getFrameIndex(context, visualConfig, currentlyMoving, timeMs) ?: 0
+                            val cacheKey = "npc_mod_${visualConfig.bodyFolder}_${visualConfig.bodyPrefix}_${visualConfig.hairId}_${visualConfig.hairColor.value}_${visualConfig.shirtColor.value}_${visualConfig.pantsColor.value}_${npc.facingRight}_${frameIndex}_${screenDensity}"
+
+                            val base64Image = base64Cache.getOrPut(cacheKey) {
+                                val bitmap = ovh.gabrielhuav.pow.features.map_exterior.ui.components.CharacterSpriteManager.generateAssembledBitmap(
+                                    context, visualConfig, currentlyMoving, timeMs
+                                )
+                                if (bitmap != null) {
+                                    val outputStream = java.io.ByteArrayOutputStream()
+                                    bitmap.compress(android.graphics.Bitmap.CompressFormat.WEBP, 90, outputStream)
+                                    "data:image/webp;base64," + android.util.Base64.encodeToString(outputStream.toByteArray(), android.util.Base64.NO_WRAP)
+                                } else { "" }
+                            }
+
+                            val flipScale = if (npc.facingRight) 1 else -1
+
+                            NpcWebPayload(
+                                id = npc.id,
+                                lat = npc.location.latitude,
+                                lng = npc.location.longitude,
+                                rot = 0f,
+                                type = "MODULAR",
+                                base64 = base64Image,
+                                flip = flipScale,
+                                name = npc.displayName
+                            )
+
                         } else {
-                            "{id:'${npc.id}',lat:${npc.location.latitude},lng:${npc.location.longitude}," +
-                                    "rot:${npc.rotationAngle},type:'${npc.type.name}',drawable:'${npc.type.drawableName}'}"
+                            NpcWebPayload(
+                                id = npc.id,
+                                lat = npc.location.latitude,
+                                lng = npc.location.longitude,
+                                rot = npc.rotationAngle,
+                                type = npc.type.name,
+                                drawable = npc.type.drawableName,
+                                name = npc.displayName
+                            )
                         }
                     }
+                    val npcsJson = gson.toJson(npcPayloads)
                     wv.evaluateJavascript("if(typeof updateNpcs==='function')updateNpcs($npcsJson);", null)
                 }
             )
         }
-
         // ─── CAPA 2, 3, 4, 5, 6, 7 (Idénticas) ──────────────────────────────────
         ovh.gabrielhuav.pow.features.map_exterior.ui.components.PlayerCharacter(
             action = uiState.playerAction,
@@ -354,6 +437,18 @@ private fun CacheChip(label: String, text: String, color: Color, isLoading: Bool
     }
 }
 
+private data class NpcWebPayload(
+    val id: String,
+    val lat: Double,
+    val lng: Double,
+    val rot: Float,
+    val type: String,
+    val base64: String? = null,
+    val drawable: String? = null,
+    val flip: Int? = null,
+    val name: String? = null
+)
+
 private fun buildHtml(lat: Double, lng: Double, zoom: Int): String = """
 <!DOCTYPE html>
 <html>
@@ -399,16 +494,21 @@ private fun buildHtml(lat: Double, lng: Double, zoom: Int): String = """
         
         function changeTileUrl(url) { if (currentTileLayer) currentTileLayer.setUrl(url); }
         function setRoadNetworkReady(ready) { window.roadNetworkReady = ready; }
+        function escapeHtml(value) {
+            return String(value).replace(/[&<>"']/g, function(char) {
+                var replacements = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+                return replacements[char] || char;
+            });
+        }
 
         function updateNpcs(data) {
-            // CRÍTICO: Si Leaflet está haciendo su animación CSS de zoom, pausamos las 
-            // actualizaciones de posición para evitar que las coordenadas se corrompan visualmente.
+            // CRÍTICO: Si Leaflet está haciendo su animación CSS de zoom, pausamos
             if (isZooming) return;
-
+        
             var currentZoom = map.getZoom();
             var isZoomedIn = currentZoom >= 15.0;
             
-            // 1. CULLING Visual
+            // 1. CULLING Visual (Limpieza de marcadores fuera de rango)
             var ids = new Set();
             if (isZoomedIn) {
                 ids = new Set(data.map(function(n) { return n.id; }));
@@ -420,54 +520,58 @@ private fun buildHtml(lat: Double, lng: Double, zoom: Int): String = """
                     delete npcMarkers[id]; 
                 }
             }
-
+        
             if (!isZoomedIn) return;
-
-            var dynamicScale = 1.6 * Math.pow(2, currentZoom - 19);
-            dynamicScale = Math.max(0.1, Math.min(dynamicScale, 1.8));
-            var sz = Math.max(5, Math.round(80 * dynamicScale));
-
+        
+            // Escala del Sprite base (tamaño para un auto)
+            var dynamicScale = 1.4 * Math.pow(2, currentZoom - 19);
+            dynamicScale = Math.max(0.6, Math.min(dynamicScale, 1.4));
+            var sz = Math.max(10, Math.round(110 * dynamicScale));
+            
             data.forEach(function(npc) {
+                // Modular es 35% de un coche = match con jugador
+                var finalSz = (npc.type === 'CAR') ? sz : Math.round(sz * 0.45);
+        
+                // Etiqueta flotante NameTag
+                var nameTagHtml = '';
+                if (npc.name) {
+                    var safeName = escapeHtml(npc.name);
+                    nameTagHtml = '<div style="position:absolute; top:-28px; ' + 
+                  'left:50%; transform:translateX(-50%); ' +
+                  'color:#D4AF37; ' + 
+                  'background:rgba(0,0,0,0.65); padding:2px 6px; border-radius:4px; ' +
+                  'font-size:16px; ' + 
+                  'font-weight:bold; white-space:nowrap; text-shadow:1px 1px 0 #000; z-index:100;">' + 
+                  safeName + '</div>';
+                }
+
                 if (npcMarkers[npc.id]) {
-                    // Actualizamos coordenada geográfica real
                     npcMarkers[npc.id].setLatLng([npc.lat, npc.lng]);
-                    
                     var el = npcMarkers[npc.id].getElement();
                     if (el) {
                         var wrapper = el.querySelector('.npc-c');
                         var img = el.querySelector('img');
                         
-                        if (npc.type === 'CAR' && img && wrapper) {
+                        if ((npc.type === 'CAR' || npc.type === 'MODULAR') && img && wrapper) {
                             if (img.src !== npc.base64) img.src = npc.base64;
-                            
-                            // Ajustamos tamaño dinámico usando estilos directos, SIN llamar a setIcon()
-                            wrapper.style.width = sz + 'px';
-                            wrapper.style.height = sz + 'px';
-                        } else if (wrapper) {
-                            // Para peatones u otros NPCs, rotamos el wrapper preservando el centrado
+                            wrapper.style.width = finalSz + 'px';
+                            wrapper.style.height = finalSz + 'px';
+                            if (npc.flip !== undefined) img.style.transform = 'scaleX(' + npc.flip + ')';
+                        } else if (wrapper && npc.type !== 'CAR' && npc.type !== 'MODULAR') {
                             wrapper.style.transform = 'translate(-50%, -50%) rotate(' + npc.rot + 'deg)';
                         }
                     }
                 } else {
-                    var finalSz = (npc.type === 'CAR') ? sz : 24; 
                     var html = '';
-                    
-                    if (npc.type === 'CAR') {
-                        // El truco del CSS: transform: translate(-50%, -50%) forzará a que el centro geográfico 
-                        // sea el centro exacto del vehículo.
-                        html = '<div class="npc-c" style="position:absolute; transform: translate(-50%, -50%); width:'+finalSz+'px; height:'+finalSz+'px;"><img src="'+npc.base64+'" style="width:100%; height:100%; display:block;"></div>';
+                    if (npc.type === 'CAR' || npc.type === 'MODULAR') {
+                        var flipStyle = (npc.flip !== undefined) ? 'transform: scaleX(' + npc.flip + ');' : '';
+                        html = '<div class="npc-c" style="position:absolute; transform: translate(-50%, -50%); width:'+finalSz+'px; height:'+finalSz+'px;">' + nameTagHtml + '<img src="'+npc.base64+'" style="width:100%; height:100%; display:block; ' + flipStyle + '"></div>';
                     } else {
                         var pUrl = 'file:///android_asset/' + npc.drawable + '.svg';
-                        html = '<div class="npc-c" style="position:absolute; transform: translate(-50%, -50%) rotate('+npc.rot+'deg); width:24px; height:24px;"><img src="'+pUrl+'" style="width:100%; height:100%; display:block;"></div>';
+                        html = '<div class="npc-c" style="position:absolute; transform: translate(-50%, -50%) rotate('+npc.rot+'deg); width:24px; height:24px;">' + nameTagHtml + '<img src="'+pUrl+'" style="width:100%; height:100%; display:block;"></div>';
                     }
                     
-                    var icon = L.divIcon({ 
-                        html: html, 
-                        className: '', 
-                        // TRUCO MAESTRO: Ancla 0x0. Le decimos a Leaflet que no calcule offsets.
-                        // Todo el centrado lo maneja el CSS translate(-50%, -50%) internamente.
-                        iconSize: [0, 0] 
-                    });
+                    var icon = L.divIcon({ html: html, className: '', iconSize: [0, 0] });
                     npcMarkers[npc.id] = L.marker([npc.lat, npc.lng], { icon: icon }).addTo(map);
                 }
             });
